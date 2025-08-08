@@ -18,12 +18,16 @@ from newrelic_lambda_cli.utils import catch_boto_errors
 
 NEW_RELIC_ENV_VARS = (
     "NEW_RELIC_ACCOUNT_ID",
+    "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
     "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
     "NEW_RELIC_LAMBDA_EXTENSION_ENABLED",
     "NEW_RELIC_LAMBDA_HANDLER",
     "NEW_RELIC_LICENSE_KEY",
     "NEW_RELIC_LOG_ENDPOINT",
     "NEW_RELIC_TELEMETRY_ENDPOINT",
+    "NEW_RELIC_APM_LAMBDA_MODE",
+    "NR_TAGS",
+    "NR_ENV_DELIMITER",
 )
 
 
@@ -118,6 +122,7 @@ def _add_new_relic(input, config, nr_license_key):
         success(
             "Already installed on function '%s'. Pass --upgrade (or -u) to allow "
             "upgrade or reinstall to latest layer version."
+            "Additionally pass --apm to enable APM Lambda mode."
             % config["Configuration"]["FunctionArn"]
         )
         return True
@@ -199,10 +204,52 @@ def _add_new_relic(input, config, nr_license_key):
             "NEW_RELIC_LAMBDA_EXTENSION_ENABLED"
         ] = "true"
 
-        update_kwargs["Environment"]["Variables"][
-            "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS"
-        ] = ("true" if input.enable_extension_function_logs else "false")
+        if not input.upgrade:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS"
+            ] = "false"
+        elif input.enable_extension_function_logs or input.send_function_logs:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS"
+            ] = "true"
+            success(
+                "Successfully enabled NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS tag to the function"
+            )
+        elif input.disable_extension_function_logs or input.disable_function_logs:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS"
+            ] = "false"
+            success(
+                "Successfully disabled NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS tag to the function"
+            )
 
+        if not input.upgrade:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS"
+            ] = "false"
+        elif input.send_extension_logs:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS"
+            ] = "true"
+            success(
+                "Successfully enabled NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS tag to the function"
+            )
+        elif input.disable_extension_logs:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS"
+            ] = "false"
+            success(
+                "Successfully disabled NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS tag to the function"
+            )
+
+        if input.nr_tags:
+            update_kwargs["Environment"]["Variables"]["NR_TAGS"] = input.nr_tags
+            success("Successfully added NR_TAGS tag to the function")
+        if input.nr_env_delimiter:
+            update_kwargs["Environment"]["Variables"][
+                "NR_ENV_DELIMITER"
+            ] = input.nr_env_delimiter
+            success("Successfully added NR_ENV_DELIMITER tag to the function")
         if input.nr_region == "staging":
             update_kwargs["Environment"]["Variables"][
                 "NEW_RELIC_TELEMETRY_ENDPOINT"
@@ -211,14 +258,19 @@ def _add_new_relic(input, config, nr_license_key):
                 "NEW_RELIC_LOG_ENDPOINT"
             ] = "https://staging-log-api.newrelic.com/log/v1"
 
-        if nr_license_key:
+        if input.nr_ingest_key:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_LICENSE_KEY"
+            ] = input.nr_ingest_key
+            success("Using New Relic ingest key for layer configuration")
+        elif nr_license_key:
             update_kwargs["Environment"]["Variables"][
                 "NEW_RELIC_LICENSE_KEY"
             ] = nr_license_key
-    else:
-        update_kwargs["Environment"]["Variables"][
-            "NEW_RELIC_LAMBDA_EXTENSION_ENABLED"
-        ] = "false"
+        else:
+            update_kwargs["Environment"]["Variables"][
+                "NEW_RELIC_LAMBDA_EXTENSION_ENABLED"
+            ] = "false"
 
     if "dotnet" in runtime:
         update_kwargs["Environment"]["Variables"]["CORECLR_ENABLE_PROFILING"] = "1"
@@ -232,11 +284,26 @@ def _add_new_relic(input, config, nr_license_key):
             "CORECLR_PROFILER_PATH"
         ] = "/opt/lib/newrelic-dotnet-agent/libNewRelicProfiler.so"
 
+    if input.apm:
+        success(
+            "Enabling APM Lambda mode for function '%s' "
+            % config["Configuration"]["FunctionArn"]
+        )
+        update_kwargs["Environment"]["Variables"]["NEW_RELIC_APM_LAMBDA_MODE"] = "True"
+
     return update_kwargs
 
 
 @catch_boto_errors
 def install(input, function_arn):
+    if input.nr_api_key and input.nr_ingest_key:
+        raise click.UsageError(
+            "Please provide either the --nr-api-key or the --nr-ingest-key flag, but not both."
+        )
+    if not input.nr_api_key and not input.nr_ingest_key:
+        raise click.UsageError(
+            "Please provide either the --nr-api-key or the --nr-ingest-key flag."
+        )
     assert isinstance(input, LayerInstall)
 
     client = input.session.client("lambda")
@@ -288,6 +355,8 @@ def install(input, function_arn):
     ):
         gql = api.validate_gql_credentials(input)
         nr_license_key = api.retrieve_license_key(gql)
+    elif input.nr_ingest_key:
+        nr_license_key = input.nr_ingest_key
 
     update_kwargs = _add_new_relic(input, config, nr_license_key)
     if isinstance(update_kwargs, bool):
@@ -295,6 +364,14 @@ def install(input, function_arn):
 
     try:
         res = client.update_function_configuration(**update_kwargs)
+        if input.apm:
+            client.tag_resource(
+                Resource=config["Configuration"]["FunctionArn"],
+                Tags={
+                    "NR.Apm.Lambda.Mode": "true",
+                },
+            )
+            success("Successfully added APM tag to the function")
     except botocore.exceptions.ClientError as e:
         failure(
             "Failed to update configuration for '%s': %s"
@@ -313,7 +390,25 @@ def install(input, function_arn):
         if input.verbose:
             click.echo(json.dumps(res, indent=2))
 
-        success("Successfully installed layer on %s" % function_arn)
+        old_layers = config["Configuration"].get("Layers", [])
+        old_layer_arn = old_layers[0]["Arn"].rsplit(":", 1)[0] if old_layers else "None"
+        old_layer_version = (
+            old_layers[0]["Arn"].split(":")[-1] if old_layers else "None"
+        )
+        new_layer = update_kwargs["Layers"][0]
+        new_layer_arn = update_kwargs["Layers"][0].rsplit(":", 1)[0]
+        new_layer_version = update_kwargs["Layers"][0].split(":")[-1]
+
+        if old_layer_arn == "None":
+            success(
+                "Successfully installed Layer ARN %s for the function: %s"
+                % (new_layer, function_arn)
+            )
+        else:
+            success(
+                "Successfully upgraded Layer ARN %s from version: %s to version: %s for the function: %s"
+                % (new_layer_arn, old_layer_version, new_layer_version, function_arn)
+            )
         return True
 
 
@@ -412,7 +507,11 @@ def uninstall(input, function_arn):
         if input.verbose:
             click.echo(json.dumps(res, indent=2))
 
-        success("Successfully uninstalled layer on %s" % function_arn)
+        old_layers = config["Configuration"].get("Layers", [])
+        old_layer_arn = old_layers[0]["Arn"] if old_layers else "None"
+        success(
+            "Successfully uninstalled Layer %s from %s" % (old_layer_arn, function_arn)
+        )
         return True
 
 
